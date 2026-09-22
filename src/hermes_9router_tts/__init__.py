@@ -113,8 +113,8 @@ class NineRouterTTSProvider(TTSProvider):
 
     def __init__(self) -> None:
         self._models_cache: Optional[Tuple[List[str], float]] = None
-        # Round-robin iterators per voice alias, keyed by alias name
-        self._el_robins: Dict[str, Iterator] = {}
+        # State per voice alias for load balancing
+        self._el_states: Dict[str, Dict[str, Any]] = {}
         # Cached DB keys: {connection_name: api_key}
         self._db_keys_cache: Optional[Tuple[Dict[str, str], float]] = None
 
@@ -276,11 +276,30 @@ class NineRouterTTSProvider(TTSProvider):
 
         return []
 
-    def _el_round_robin(self, voice_alias: str, entries: List[Dict[str, str]]) -> Iterator:
-        """Get or create a round-robin iterator for a voice alias."""
-        if voice_alias not in self._el_robins:
-            self._el_robins[voice_alias] = itertools.cycle(entries)
-        return self._el_robins[voice_alias]
+    def _el_pick_entry(self, voice_alias: str, entries: List[Dict[str, str]]) -> Dict[str, str]:
+        """Pick next entry based on strategy (fill-first or round-robin)."""
+        settings = _load_settings()
+        el_config = settings.get("elevenlabs") or {}
+        strategy = str(el_config.get("strategy", "fill-first")).lower().strip()
+
+        if voice_alias not in self._el_states:
+            self._el_states[voice_alias] = {"index": 0, "robin": itertools.cycle(entries)}
+
+        state = self._el_states[voice_alias]
+
+        if strategy == "round-robin":
+            return next(state["robin"])
+        else:
+            # fill-first: stick to current index until it fails
+            idx = state.get("index", 0) % len(entries)
+            return entries[idx]
+
+    def _el_advance(self, voice_alias: str, entries: List[Dict[str, str]]) -> None:
+        """Advance fill-first to next entry (called on failure)."""
+        if voice_alias not in self._el_states:
+            return
+        state = self._el_states[voice_alias]
+        state["index"] = (state.get("index", 0) + 1) % len(entries)
 
     def _synthesize_elevenlabs(
         self, text: str, output_path: str, voice: Optional[str],
@@ -317,12 +336,11 @@ class NineRouterTTSProvider(TTSProvider):
 
         db_keys = self._read_db_keys()
         alias = voice or "default"
-        robin = self._el_round_robin(alias, entries)
         errors = []
 
-        # Try each entry in round-robin order, up to len(entries) attempts
+        # Try up to len(entries) attempts
         for _ in range(len(entries)):
-            entry = next(robin)
+            entry = self._el_pick_entry(alias, entries)
             conn_name = entry.get("connection", "")
             voice_id = entry.get("voice_id", "")
             api_key = db_keys.get(conn_name)
@@ -330,9 +348,11 @@ class NineRouterTTSProvider(TTSProvider):
             if not api_key:
                 logger.warning("No API key found for ElevenLabs connection %r in 9Router DB", conn_name)
                 errors.append(f"{conn_name}: no API key in DB")
+                self._el_advance(alias, entries)
                 continue
             if not voice_id:
                 errors.append(f"{conn_name}: no voice_id")
+                self._el_advance(alias, entries)
                 continue
 
             # Determine output format
@@ -370,19 +390,23 @@ class NineRouterTTSProvider(TTSProvider):
                 if _is_quota_error(resp.status_code, body):
                     logger.warning("ElevenLabs %s hit quota/rate limit, rotating", conn_name)
                     errors.append(f"{conn_name}: {resp.status_code} quota/rate")
+                    self._el_advance(alias, entries)
                     continue
 
                 err_detail = body.get("detail", {})
                 err_msg = err_detail.get("message", "") if isinstance(err_detail, dict) else str(err_detail)
                 errors.append(f"{conn_name}: HTTP {resp.status_code} {err_msg}")
+                self._el_advance(alias, entries)
                 # Non-quota error on specific key: try next
                 continue
 
             except requests.exceptions.Timeout:
                 errors.append(f"{conn_name}: timeout")
+                self._el_advance(alias, entries)
                 continue
             except Exception as exc:
                 errors.append(f"{conn_name}: {exc}")
+                self._el_advance(alias, entries)
                 continue
 
         raise RuntimeError(f"All ElevenLabs keys failed for voice={voice!r}: {'; '.join(errors)}")
