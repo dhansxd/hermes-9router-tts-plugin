@@ -1,0 +1,4 @@
+name: 9router-tts
+version: 0.1.0
+description: "Text-to-speech via 9Router gateway with Elevenlabs direct multi-key rotation"
+type: tts
