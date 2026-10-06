@@ -444,6 +444,8 @@ class NineRouterTTSProvider(TTSProvider):
                 request_model = f"{model_id}/{voice}"
 
             payload = {"model": request_model, "input": text}
+            if voice:
+                payload["voice"] = voice
             try:
                 resp = requests.post(
                     f"{base}/v1/audio/speech",

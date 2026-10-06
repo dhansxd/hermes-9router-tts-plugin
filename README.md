@@ -7,7 +7,8 @@ Hermes plugin for Text-to-Speech via 9Router. Supports:
 ## Installation
 
 ```bash
-hermes plugins install https://github.com/dhansxd/hermes-9router-tts-plugin
+hermes plugins install dhansxd/hermes-9router-tts-plugin --enable --yes-deps
+hermes plugins doctor 9router-tts --ci
 ```
 
 ## Configuration
@@ -22,7 +23,7 @@ tts:
     model: gemini/gemini-3.1-flash-tts-preview  # Default model
     fallback_models:
       - gemini/gemini-2.5-flash-preview-tts
-    voice: rara                                 # Default voice alias
+    voice: Kore                                 # Gemini voice; use rara for ElevenLabs alias
     elevenlabs:
       model_id: eleven_flash_v2_5
       voices:
@@ -34,4 +35,17 @@ tts:
             voice_id: <elevenlabs_voice_id_2>
 ```
 
-*(API keys for ElevenLabs are securely read directly from your local 9Router SQLite database).*
+Git installs load the implementation from `src/hermes_9router_tts`; no manual symlink is needed.
+The proxy sends explicit voice selection in the `voice` payload field.
+ElevenLabs uses configured voice aliases and reads keys from the local 9Router SQLite database.
+ElevenLabs direct synthesis and key rotation need separate credentials/voice mappings and are not covered by the proxy smoke test.
+
+## Regression checks
+
+Run with Hermes's Python environment:
+
+```bash
+python test_provider.py
+```
+
+Offline checks cover fresh Git registration and proxy voice forwarding.
