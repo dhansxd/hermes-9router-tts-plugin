@@ -8,7 +8,6 @@ from __future__ import annotations
 import base64
 from datetime import datetime
 import hashlib
-import ipaddress
 import json
 import logging
 import math
@@ -75,14 +74,8 @@ def _profile() -> str:
 
 
 def _db_path(settings: Dict[str, Any]) -> Path:
-    # Local keys must never be borrowed for a remote gateway or routed profile.
-    host = urlsplit(_base_url(settings)).hostname
-    try:
-        local = ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        local = host == "localhost"
-    if not local:
-        raise ValueError("ElevenLabs DB access requires a loopback 9Router URL")
+    # Direct synthesis always uses the fixed official ElevenLabs origin.
+    # The gateway URL is independent; a routed profile must opt into its DB.
     explicit = str(settings.get("db_path") or "").strip()
     if explicit:
         return Path(explicit).expanduser().resolve()
@@ -111,8 +104,6 @@ def _timeout(settings: Dict[str, Any]) -> float:
 def _is_quota_error(status: int, body: Any) -> bool:
     if status == 429:
         return True
-    if status not in (402, 403, 500, 502, 503):
-        return False
     if not isinstance(body, dict):
         return False
     err = body.get("error") or body.get("detail")
@@ -120,6 +111,11 @@ def _is_quota_error(status: int, body: Any) -> bool:
         return False
     message = str(err.get("message") or "").lower()
     code = str(err.get("code") or err.get("status") or "").lower()
+    # ElevenLabs reports quota_exceeded on 400/401 as well as rate-limit 429.
+    if status in (400, 401):
+        return code in ("quota_exceeded", "rate_limit_exceeded", "insufficient_quota")
+    if status not in (402, 403, 500, 502, 503):
+        return False
     if "not allowed to use model" in message or "do not have permission" in message:
         return False
     if status == 403:
@@ -130,7 +126,7 @@ def _is_quota_error(status: int, body: Any) -> bool:
 
 def _provider(model: str) -> str:
     prefix = model.split("/", 1)[0].lower()
-    return {"gm": "gemini", "oa": "openai", "el": "elevenlabs"}.get(prefix, prefix)
+    return {"el": "elevenlabs"}.get(prefix, prefix)
 
 
 def _is_elevenlabs_model(model: Optional[str]) -> bool:
@@ -139,13 +135,27 @@ def _is_elevenlabs_model(model: Optional[str]) -> bool:
     return _provider(model) == "elevenlabs" or model.split("/", 1)[0].lower().startswith("eleven_")
 
 
+def _encoded_voice(model: str) -> Optional[str]:
+    parts = model.split("/")
+    provider = _provider(model)
+    if provider in ("gemini", "openai", "elevenlabs", "selfhosted-tts", "xiaomi-mimo", "mimo", "mimo-desktop", "xmd") and len(parts) > 2:
+        return parts[-1]
+    if parts[0].startswith("eleven_") and len(parts) > 1:
+        return parts[-1]
+    if provider == "openrouter" and len(parts) > 3:
+        return parts[-1]
+    if provider in ("edge", "edge-tts", "google", "google-tts", "local-device") and len(parts) > 1:
+        return parts[-1]
+    return None
+
+
 def _request_model(model: str, voice: Optional[str]) -> str:
     if not voice:
         return model
     # 9Router 0.5.119 consumes the voice inside model, not body.voice.
     provider, sep, remainder = model.partition("/")
     canonical = _provider(model)
-    if canonical in ("gemini", "openai", "openrouter"):
+    if canonical in ("gemini", "openai", "openrouter", "selfhosted-tts", "xiaomi-mimo", "mimo", "mimo-desktop", "xmd"):
         if not sep:
             raise ValueError("Use provider/model when selecting a voice")
         if canonical == "openrouter":
@@ -353,25 +363,26 @@ class NineRouterTTSProvider(TTSProvider):
             logger.debug("Local 9Router ElevenLabs keys unavailable")
         return keys
 
-    def _el_order(self, identity, entries, strategy):
+    def _el_order(self, identity, entries, strategy, attempted=()):
         with self._state_lock:
             if len(self._el_states) >= 64 and identity not in self._el_states:
                 self._el_states.clear()
             state = self._el_states.setdefault(identity, {"index": 0, "cooldown": {}})
             now = time.monotonic()
-            available = [i for i in range(len(entries)) if state["cooldown"].get(i, 0) <= now]
+            available = [i for i in range(len(entries)) if i not in attempted and state["cooldown"].get(i, 0) <= now]
             start = state["index"] % len(entries)
             ordered = sorted(available, key=lambda i: (i - start) % len(entries))
             if ordered and strategy == "round-robin":
                 state["index"] = (ordered[0] + 1) % len(entries)
             return ordered
 
-    def _el_quota(self, identity, index, count):
+    def _el_quota(self, identity, index, count, strategy):
         with self._state_lock:
             state = self._el_states.get(identity)
             if state is not None:
                 state["cooldown"][index] = time.monotonic() + 60
-                state["index"] = (index + 1) % count
+                if strategy == "fill-first":
+                    state["index"] = (index + 1) % count
 
     def _synthesize_elevenlabs(self, text, output_path, voice, model, fmt, settings, speed):
         el = settings.get("elevenlabs") or {}
@@ -411,8 +422,13 @@ class NineRouterTTSProvider(TTSProvider):
             el_format, actual = "opus_48000_64", "ogg"
         else:
             el_format, actual = "mp3_44100_128", "mp3"
-        order = self._el_order(identity, entries, strategy)
-        for index in order:
+        attempted = set()
+        for _ in range(len(entries)):
+            order = self._el_order(identity, entries, strategy, attempted)
+            if not order:
+                break
+            index = order[0]
+            attempted.add(index)
             _, voice_id, key = entries[index]
             payload = {"text": text, "model_id": model_id}
             if speed is not None:
@@ -435,7 +451,7 @@ class NineRouterTTSProvider(TTSProvider):
                         body = {}
                     if not _is_quota_error(response.status_code, body):
                         raise RuntimeError("ElevenLabs synthesis failed (HTTP %s)" % response.status_code)
-                    self._el_quota(identity, index, len(entries))
+                    self._el_quota(identity, index, len(entries), strategy)
                 finally:
                     response.close()
         raise RuntimeError("All eligible ElevenLabs connections are quota-limited; retry later")
@@ -477,15 +493,16 @@ class NineRouterTTSProvider(TTSProvider):
                    model: Optional[str] = None, speed: Optional[float] = None,
                    format: str = "mp3", **extra: Any) -> str:
         settings = _load_settings()
-        voice = voice or str(settings.get("voice") or settings.get("default_voice") or "").strip() or None
-        if voice and ("/" in voice or any(ord(c) < 32 for c in voice)):
-            raise ValueError("voice must be a single voice ID or alias")
         model = str(model or settings.get("model") or "").strip()
         if not model:
             models = self._fetch_models(settings)
             model = models[0] if models else ""
         if not model:
             raise ValueError("No TTS model configured or available from 9Router")
+        voice = (voice or _encoded_voice(model)
+                 or str(settings.get("voice") or settings.get("default_voice") or "").strip() or None)
+        if voice and ("/" in voice or any(ord(c) < 32 for c in voice)):
+            raise ValueError("voice must be a single voice ID or alias")
         if speed is not None:
             speed = float(speed)
             if not math.isfinite(speed) or speed <= 0:
