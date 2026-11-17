@@ -1,4 +1,4 @@
 name: 9router-tts
-version: 0.1.1
+version: 0.1.2
 description: "Text-to-speech via 9Router with optional local ElevenLabs key rotation"
 kind: backend

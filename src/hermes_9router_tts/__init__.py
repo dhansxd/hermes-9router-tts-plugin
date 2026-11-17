@@ -1,7 +1,7 @@
 """Native Hermes TTS via 9Router, with optional local ElevenLabs key rotation.
 
 No I/O at import or registration. Settings are read for each call from the active
-Hermes profile. Only explicit fallback models and quota failures are retried.
+Hermes profile. Gateway is the default; direct ElevenLabs is explicit or legacy-opted-in.
 """
 from __future__ import annotations
 
@@ -126,7 +126,7 @@ def _is_quota_error(status: int, body: Any) -> bool:
 
 def _provider(model: str) -> str:
     prefix = model.split("/", 1)[0].lower()
-    return {"el": "elevenlabs"}.get(prefix, prefix)
+    return "elevenlabs" if prefix == "el" or prefix.startswith("eleven_") else prefix
 
 
 def _is_elevenlabs_model(model: Optional[str]) -> bool:
@@ -135,12 +135,56 @@ def _is_elevenlabs_model(model: Optional[str]) -> bool:
     return _provider(model) == "elevenlabs" or model.split("/", 1)[0].lower().startswith("eleven_")
 
 
+def _legacy_direct(settings: Dict[str, Any], model: str) -> bool:
+    """Recognize local-rotation intent, never a model/voice alone."""
+    if not _is_elevenlabs_model(model):
+        return False
+    if isinstance(settings.get("db_path"), str) and settings["db_path"].strip():
+        return True
+    el = settings.get("elevenlabs")
+    if not isinstance(el, dict):
+        return False
+    if any(isinstance(el.get(key), str) and el[key].strip()
+           for key in ("strategy", "model_id")):
+        return True
+    voices = el.get("voices")
+    if not isinstance(voices, dict):
+        return False
+    return any(
+        isinstance(entry, dict)
+        and all(isinstance(entry.get(key), str) and entry[key].strip()
+                for key in ("connection", "voice_id"))
+        for entries in voices.values() if isinstance(entries, list)
+        for entry in entries
+    )
+
+
+def _transport(settings: Dict[str, Any], model: Optional[str] = None) -> str:
+    if "transport" in settings:
+        value = settings["transport"]
+        if not isinstance(value, str) or value.strip() not in ("gateway", "elevenlabs-direct"):
+            raise ValueError("transport must be gateway or elevenlabs-direct")
+        selected = value.strip()
+        if selected == "elevenlabs-direct" and not _is_elevenlabs_model(model):
+            raise ValueError("elevenlabs-direct requires an explicit ElevenLabs model")
+        return selected
+    return "elevenlabs-direct" if _legacy_direct(settings, model or "") else "gateway"
+
+
 def _encoded_voice(model: str) -> Optional[str]:
     parts = model.split("/")
     provider = _provider(model)
-    if provider in ("gemini", "openai", "elevenlabs", "selfhosted-tts", "xiaomi-mimo", "mimo", "mimo-desktop", "xmd") and len(parts) > 2:
-        return parts[-1]
-    if parts[0].startswith("eleven_") and len(parts) > 1:
+    if provider == "elevenlabs":
+        if parts[0].lower() in ("el", "elevenlabs"):
+            remainder = parts[1:]
+        else:
+            remainder = parts
+        if len(remainder) == 2:
+            return remainder[1]
+        if len(remainder) == 1 and not remainder[0].startswith("eleven_"):
+            return remainder[0] or None
+        return None
+    if provider in ("gemini", "openai", "selfhosted-tts", "xiaomi-mimo", "mimo", "mimo-desktop", "xmd") and len(parts) > 2:
         return parts[-1]
     if provider == "openrouter" and len(parts) > 3:
         return parts[-1]
@@ -150,6 +194,18 @@ def _encoded_voice(model: str) -> Optional[str]:
 
 
 def _request_model(model: str, voice: Optional[str]) -> str:
+    if _is_elevenlabs_model(model):
+        parts = model.split("/")
+        remainder = parts[1:] if parts[0].lower() in ("el", "elevenlabs") else parts
+        if not remainder or len(remainder) > 2 or any(not part for part in remainder):
+            raise ValueError("Use elevenlabs/voice_id or elevenlabs/model_id/voice_id")
+        voice = voice or _encoded_voice(model)
+        if not voice:
+            raise ValueError("An ElevenLabs model requires a voice_id for gateway synthesis")
+        # A one-part non-model remainder is a voice-only shorthand.
+        if len(remainder) == 1 and not remainder[0].startswith("eleven_"):
+            return "elevenlabs/" + voice
+        return "elevenlabs/" + remainder[0] + "/" + voice
     if not voice:
         return model
     # 9Router 0.5.119 consumes the voice inside model, not body.voice.
@@ -224,6 +280,7 @@ class NineRouterTTSProvider(TTSProvider):
         self._models_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._el_states = {}
+        self._transport_notices = set()
 
     @property
     def name(self) -> str:
@@ -251,6 +308,7 @@ class NineRouterTTSProvider(TTSProvider):
     def default_model(self) -> Optional[str]:
         settings = _load_settings()
         configured = str(settings.get("model") or "").strip()
+        _transport(settings, configured)
         if configured:
             return configured
         models = self._fetch_models(settings)
@@ -261,6 +319,8 @@ class NineRouterTTSProvider(TTSProvider):
 
     def list_voices(self) -> List[Dict[str, Any]]:
         settings = _load_settings()
+        if _transport(settings, str(settings.get("model") or "").strip()) != "elevenlabs-direct":
+            return []
         el = settings.get("elevenlabs")
         voices = el.get("voices") if isinstance(el, dict) else None
         if not isinstance(voices, dict):
@@ -500,16 +560,42 @@ class NineRouterTTSProvider(TTSProvider):
                     response.close()
         raise RuntimeError("Configured 9Router TTS models are quota-limited; retry later")
 
+    def _notice_implicit_transport(self, settings, model, transport):
+        if "transport" in settings or not _is_elevenlabs_model(model):
+            return
+        identity = (_profile(), transport)
+        with self._state_lock:
+            if identity in self._transport_notices:
+                return
+            if len(self._transport_notices) >= 64:
+                self._transport_notices.clear()
+            self._transport_notices.add(identity)
+        if transport == "elevenlabs-direct":
+            logger.warning(
+                "Legacy ElevenLabs direct settings detected. Set "
+                "tts.9router-tts.transport: elevenlabs-direct to keep local rotation, "
+                "or gateway to use 9Router."
+            )
+        else:
+            logger.warning(
+                "ElevenLabs defaults to the 9Router gateway. Set "
+                "tts.9router-tts.transport: gateway explicitly; users of legacy "
+                "direct model/voice-only configs must set elevenlabs-direct to retain direct routing."
+            )
+
     def synthesize(self, text: str, output_path: str, *, voice: Optional[str] = None,
                    model: Optional[str] = None, speed: Optional[float] = None,
                    format: str = "mp3", **extra: Any) -> str:
         settings = _load_settings()
         model = str(model or settings.get("model") or "").strip()
+        # Reject invalid selectors and incompatible explicit direct configs before I/O.
+        transport = _transport(settings, model)
         if not model:
             models = self._fetch_models(settings)
             model = models[0] if models else ""
         if not model:
             raise ValueError("No TTS model configured or available from 9Router")
+        transport = _transport(settings, model)
         voice = (voice or _encoded_voice(model)
                  or str(settings.get("voice") or settings.get("default_voice") or "").strip() or None)
         if voice and ("/" in voice or any(ord(c) < 32 for c in voice)):
@@ -520,7 +606,8 @@ class NineRouterTTSProvider(TTSProvider):
                 raise ValueError("speed must be positive and finite")
         _timeout(settings)
         fmt = str(format).strip().lower()
-        if _is_elevenlabs_model(model):
+        self._notice_implicit_transport(settings, model, transport)
+        if transport == "elevenlabs-direct":
             return self._synthesize_elevenlabs(text, output_path, voice, model, fmt, settings, speed)
         return self._synthesize_9router(text, output_path, voice, model, fmt, settings, speed)
 

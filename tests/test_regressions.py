@@ -107,6 +107,7 @@ class Regressions(unittest.TestCase):
         path = self.database()
         self.settings.update({
             "model": "el/eleven_flash_v2_5", "voice": "narrator",
+            "transport": "elevenlabs-direct",
             "elevenlabs": {"strategy": "round-robin", "voices": {
                 "narrator": [
                     {"connection": "fixture-one", "voice_id": "Voice0001"},
@@ -365,7 +366,7 @@ class Regressions(unittest.TestCase):
         metadata = tomllib.loads((SOURCE / "pyproject.toml").read_text())
         self.assertEqual(metadata["project"]["entry-points"]["hermes_agent.plugins"]["9router-tts"],
                          "hermes_9router_tts:register")
-        self.assertEqual(metadata["project"]["version"], "0.1.1")
+        self.assertEqual(metadata["project"]["version"], "0.1.2")
 
     def test_ambiguous_connection_names_are_not_used(self):
         self.database([
@@ -478,6 +479,229 @@ class Regressions(unittest.TestCase):
         ])
         self.assertEqual(self.provider._read_db_keys(model="eleven_flash_v2_5"),
                          {"eligible": "synthetic-two"})
+
+
+    def test_new_elevenlabs_models_use_gateway_without_database(self):
+        for model in ("el/eleven_flash_v2_5", "elevenlabs/eleven_flash_v2_5",
+                      "eleven_flash_v2_5"):
+            with self.subTest(model=model):
+                self.settings = {"base_url": "http://127.0.0.1:20128", "model": model}
+                self.calls.clear()
+                self.responses = [response()]
+                with patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Gateway opened keys")), \
+                     patch("sqlite3.connect", side_effect=AssertionError("Gateway opened SQLite")):
+                    self.synthesize(voice="Voice0009")
+                self.assertEqual(len(self.calls), 1)
+                _, _, url, kwargs = self.calls[0]
+                self.assertEqual(url, "http://127.0.0.1:20128/v1/audio/speech")
+                self.assertEqual(kwargs["json"]["model"], "elevenlabs/eleven_flash_v2_5/Voice0009")
+                self.assertEqual(kwargs["headers"].get("Authorization"), "Bearer synthetic-router-key")
+                self.assertNotIn("xi-api-key", kwargs["headers"])
+
+    def test_explicit_gateway_overrides_legacy_elevenlabs_markers(self):
+        self.elevenlabs()
+        self.settings["transport"] = "gateway"
+        with patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Gateway opened keys")), \
+             patch("sqlite3.connect", side_effect=AssertionError("Gateway opened SQLite")), \
+             patch.object(impl.logger, "warning") as warning:
+            self.synthesize(voice="Voice0009")
+        self.assertEqual(self.calls[0][2], "http://127.0.0.1:20128/v1/audio/speech")
+        self.assertEqual(self.calls[0][3]["json"]["model"], "elevenlabs/eleven_flash_v2_5/Voice0009")
+        warning.assert_not_called()
+
+    def test_explicit_direct_transport_retains_rotation_without_migration_warning(self):
+        self.elevenlabs()
+        self.settings["transport"] = "elevenlabs-direct"
+        self.responses = [response(), response()]
+        with patch.object(impl.logger, "warning") as warning:
+            self.synthesize("first.mp3")
+            self.synthesize("second.mp3")
+        self.assertEqual([call[3]["headers"]["xi-api-key"] for call in self.calls],
+                         ["synthetic-key-one", "synthetic-key-two"])
+        self.assertTrue(all(call[2].startswith("https://api.elevenlabs.io/v1/text-to-speech/")
+                            for call in self.calls))
+        warning.assert_not_called()
+
+    def test_legacy_direct_markers_keep_routing_and_emit_safe_migration_notice(self):
+        self.elevenlabs()
+        self.settings.pop("transport", None)
+        with self.assertLogs(impl.logger.name, level="WARNING") as logs:
+            self.synthesize()
+        self.assertEqual(self.calls[0][2], "https://api.elevenlabs.io/v1/text-to-speech/Voice0001")
+        notice = "\n".join(logs.output)
+        self.assertIn("transport", notice.lower())
+        self.assertIn("elevenlabs-direct", notice.lower())
+        for private in ("synthetic-key-one", "synthetic-key-two", "Voice0001",
+                        "Voice0002", "fixture-one", str(self.settings["db_path"])):
+            self.assertNotIn(private, notice)
+
+    def test_invalid_transport_rejects_before_catalog_http_or_database(self):
+        self.settings = {"transport": "invalid-transport"}
+        with patch.object(self.provider, "_fetch_models", side_effect=AssertionError("Invalid transport fetched catalog")), \
+             patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Invalid transport opened keys")), \
+             patch("sqlite3.connect", side_effect=AssertionError("Invalid transport opened SQLite")):
+            with self.assertRaises(ValueError):
+                self.synthesize()
+        self.assertEqual(self.calls, [])
+
+    def test_direct_transport_rejects_non_elevenlabs_before_io(self):
+        self.settings["transport"] = "elevenlabs-direct"
+        self.settings["model"] = "gemini/fixture"
+        with patch.object(self.provider, "_fetch_models", side_effect=AssertionError("Direct fetched catalog")), \
+             patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Direct opened keys")), \
+             patch("sqlite3.connect", side_effect=AssertionError("Direct opened SQLite")):
+            with self.assertRaises(ValueError):
+                self.synthesize()
+        self.assertEqual(self.calls, [])
+
+    def test_gateway_failures_never_switch_to_direct_transport(self):
+        self.elevenlabs()
+        self.settings["transport"] = "gateway"
+        self.settings["fallback_models"] = ["elevenlabs/eleven_turbo_v2_5"]
+        for status, expected_calls in ((401, 1), (429, 2)):
+            with self.subTest(status=status):
+                self.calls.clear()
+                self.responses = [response(status, body={"error": {"message": "synthetic failure"}})
+                                  for _ in range(expected_calls)]
+                with patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Gateway fallback opened keys")), \
+                     patch("sqlite3.connect", side_effect=AssertionError("Gateway fallback opened SQLite")):
+                    with self.assertRaises(RuntimeError):
+                        self.synthesize()
+                self.assertEqual(len(self.calls), expected_calls)
+                self.assertTrue(all(call[2] == "http://127.0.0.1:20128/v1/audio/speech"
+                                    for call in self.calls))
+                self.assertTrue(all("xi-api-key" not in call[3]["headers"] for call in self.calls))
+
+    def test_elevenlabs_gateway_aliases_encode_and_replace_only_voice(self):
+        cases = (
+            ("el/eleven_flash_v2_5", "Voice0009", "elevenlabs/eleven_flash_v2_5/Voice0009"),
+            ("elevenlabs/eleven_flash_v2_5", "Voice0009", "elevenlabs/eleven_flash_v2_5/Voice0009"),
+            ("eleven_flash_v2_5", "Voice0009", "elevenlabs/eleven_flash_v2_5/Voice0009"),
+            ("el/eleven_flash_v2_5/Voice0001", "Voice0009", "elevenlabs/eleven_flash_v2_5/Voice0009"),
+            ("elevenlabs/eleven_flash_v2_5/Voice0001", "Voice0009", "elevenlabs/eleven_flash_v2_5/Voice0009"),
+            ("eleven_flash_v2_5/Voice0001", "Voice0009", "elevenlabs/eleven_flash_v2_5/Voice0009"),
+            ("el/Voice0001", "Voice0009", "elevenlabs/Voice0009"),
+        )
+        for model, voice, expected in cases:
+            with self.subTest(model=model):
+                self.assertEqual(impl._request_model(model, voice), expected)
+
+
+    def test_empty_or_malformed_legacy_markers_stay_gateway(self):
+        cases = (
+            {"elevenlabs": {}},
+            {"elevenlabs": {"voices": {}}},
+            {"elevenlabs": {"voices": {"narrator": []}}},
+            {"elevenlabs": {"voices": {"narrator": [{"connection": " ", "voice_id": "PrivateVoice"}]}}},
+            {"elevenlabs": {"strategy": " ", "model_id": ""}, "db_path": " "},
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.settings = {"model": "el/eleven_flash_v2_5", "voice": "Voice0009", **extra}
+                self.calls.clear()
+                self.responses = [response()]
+                with patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Empty marker opened DB")):
+                    self.synthesize()
+                self.assertTrue(self.calls[0][2].endswith("/v1/audio/speech"))
+
+    def test_each_meaningful_legacy_marker_preserves_direct(self):
+        cases = (
+            {"elevenlabs": {"voices": {"narrator": [{"connection": "fixture-one", "voice_id": "Voice0001"}]}}},
+            {"elevenlabs": {"strategy": "round-robin"}},
+            {"elevenlabs": {"model_id": "eleven_flash_v2_5"}},
+            {"db_path": "/synthetic/legacy.sqlite"},
+        )
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.settings = {"model": "el/eleven_flash_v2_5", "voice": "Voice0009", **extra}
+                with patch.object(self.provider, "_synthesize_elevenlabs", return_value="direct.mp3") as direct, \
+                     patch.object(self.provider, "_synthesize_9router", side_effect=AssertionError("Legacy changed destination")):
+                    self.assertEqual(self.synthesize(), "direct.mp3")
+                direct.assert_called_once()
+
+    def test_non_elevenlabs_model_with_legacy_markers_stays_gateway(self):
+        self.settings.update({"db_path": "/synthetic/legacy.sqlite",
+                              "elevenlabs": {"strategy": "round-robin"}})
+        with patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Other provider opened DB")):
+            self.synthesize()
+        self.assertTrue(self.calls[0][2].endswith("/v1/audio/speech"))
+
+    def test_invalid_selector_values_never_infer_legacy_direct(self):
+        self.elevenlabs()
+        for selector in ("", "auto", None, True, [], {}):
+            with self.subTest(selector=selector):
+                self.settings["transport"] = selector
+                with patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Invalid selector opened DB")):
+                    with self.assertRaises(ValueError):
+                        self.synthesize()
+        self.assertEqual(self.calls, [])
+
+    def test_direct_without_model_never_fetches_gateway_catalog(self):
+        self.settings = {"transport": "elevenlabs-direct", "voice": "Voice0009"}
+        with patch.object(self.provider, "_fetch_models", side_effect=AssertionError("Direct fetched catalog")):
+            with self.assertRaises(ValueError):
+                self.synthesize()
+            with self.assertRaises(ValueError):
+                self.provider.default_model()
+        self.assertEqual(self.calls, [])
+
+    def test_direct_ignores_router_url_and_router_key(self):
+        self.elevenlabs()
+        self.settings["base_url"] = "not-a-router-url"
+        with patch.object(impl, "_api_key", side_effect=AssertionError("Direct read router key")):
+            self.synthesize()
+        self.assertTrue(self.calls[0][2].startswith("https://api.elevenlabs.io/"))
+
+    def test_encoded_elevenlabs_gateway_voice_precedes_config_default(self):
+        for model, expected in (
+            ("el/VoiceEmbedded", "elevenlabs/VoiceEmbedded"),
+            ("elevenlabs/VoiceEmbedded", "elevenlabs/VoiceEmbedded"),
+            ("el/eleven_flash_v2_5/VoiceEmbedded", "elevenlabs/eleven_flash_v2_5/VoiceEmbedded"),
+            ("eleven_flash_v2_5/VoiceEmbedded", "elevenlabs/eleven_flash_v2_5/VoiceEmbedded"),
+        ):
+            with self.subTest(model=model):
+                self.settings = {"model": model, "voice": "VoiceDefault", "transport": "gateway"}
+                self.calls.clear()
+                self.responses = [response()]
+                self.synthesize()
+                self.assertEqual(self.calls[0][3]["json"]["model"], expected)
+
+    def test_incomplete_elevenlabs_gateway_models_fail_without_request(self):
+        for model in ("el/eleven_flash_v2_5", "eleven_flash_v2_5",
+                      "elevenlabs/", "el/model/voice/extra", "el//voice"):
+            with self.subTest(model=model):
+                self.settings = {"model": model, "transport": "gateway"}
+                with self.assertRaises(ValueError):
+                    self.synthesize()
+        self.assertEqual(self.calls, [])
+
+    def test_catalog_elevenlabs_selection_uses_gateway_without_db(self):
+        self.settings = {"voice": "Voice0009"}
+        self.responses = [
+            response(body={"data": [{"id": "el/eleven_flash_v2_5"}]}, content_type="application/json"),
+            response(),
+        ]
+        with patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Catalog opened DB")):
+            self.synthesize()
+        self.assertEqual(self.calls[0][1], "GET")
+        self.assertTrue(self.calls[1][2].endswith("/v1/audio/speech"))
+        self.assertEqual(self.calls[1][3]["json"]["model"], "elevenlabs/eleven_flash_v2_5/Voice0009")
+
+    def test_implicit_transport_notices_are_once_per_profile_and_safe(self):
+        self.settings = {"model": "el/eleven_flash_v2_5", "voice": "PrivateVoice"}
+        self.responses = [response(), response(), response()]
+        with patch.object(impl.logger, "warning") as warning:
+            with patch("hermes_constants.get_hermes_home", return_value=self.root / "profile-one"):
+                self.synthesize("one.mp3")
+                self.synthesize("two.mp3")
+            with patch("hermes_constants.get_hermes_home", return_value=self.root / "profile-two"):
+                self.synthesize("three.mp3")
+        self.assertEqual(warning.call_count, 2)
+        notice = " ".join(str(call) for call in warning.call_args_list)
+        self.assertIn("gateway", notice)
+        self.assertIn("elevenlabs-direct", notice)
+        for private in ("PrivateVoice", "synthetic-router-key", str(self.root)):
+            self.assertNotIn(private, notice)
 
 
 BASELINE_CASES = [
