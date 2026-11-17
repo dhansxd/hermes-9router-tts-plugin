@@ -299,11 +299,11 @@ class Regressions(unittest.TestCase):
         ])
         self.assertEqual(self.provider._read_db_keys(), {"fixture-one": "synthetic-key-one"})
 
-    def test_explicit_direct_pool_is_independent_of_gateway_url(self):
+    def test_direct_pool_never_sends_keys_to_remote_router(self):
         self.elevenlabs()
         self.settings["base_url"] = "https://remote-router.invalid"
-        self.synthesize()
-        self.assertTrue(self.calls[0][2].startswith("https://api.elevenlabs.io/"))
+        self.synthesize(voice="narrator")
+        self.assertEqual(self.calls[0][2], "https://api.elevenlabs.io/v1/text-to-speech/Voice0001")
         self.assertEqual(self.calls[0][3]["headers"]["xi-api-key"], "synthetic-key-one")
 
     def test_elevenlabs_uses_format_query(self):
@@ -358,6 +358,126 @@ class Regressions(unittest.TestCase):
         keys = [call[3]["headers"]["xi-api-key"] for call in self.calls]
         self.assertEqual(keys.count("synthetic-key-one"), 4)
         self.assertEqual(keys.count("synthetic-key-two"), 4)
+
+
+    def test_pip_metadata_uses_native_plugin_entrypoint(self):
+        import tomllib
+        metadata = tomllib.loads((SOURCE / "pyproject.toml").read_text())
+        self.assertEqual(metadata["project"]["entry-points"]["hermes_agent.plugins"]["9router-tts"],
+                         "hermes_9router_tts:register")
+        self.assertEqual(metadata["project"]["version"], "0.1.1")
+
+    def test_ambiguous_connection_names_are_not_used(self):
+        self.database([
+            ("one", "duplicate", "elevenlabs", 1, {"apiKey": "synthetic-key-one"}),
+            ("two", "duplicate", "elevenlabs", 1, {"apiKey": "synthetic-key-two"}),
+        ])
+        self.assertEqual(self.provider._read_db_keys(), {})
+
+    def test_router_cooldown_and_model_lock_exclude_keys(self):
+        self.database([
+            ("one", "future-rate", "elevenlabs", 1, {"apiKey": "synthetic-one", "rateLimitedUntil": "2999-01-01T00:00:00Z"}),
+            ("two", "future-all", "elevenlabs", 1, {"apiKey": "synthetic-two", "modelLock___all": "2999-01-01T00:00:00Z"}),
+            ("three", "future-model", "elevenlabs", 1, {"apiKey": "synthetic-three", "modelLock_eleven_flash_v2_5": "2999-01-01T00:00:00Z"}),
+            ("four", "eligible", "elevenlabs", 1, {"apiKey": "synthetic-four"}),
+        ])
+        self.assertEqual(self.provider._read_db_keys(model="eleven_flash_v2_5"), {"eligible": "synthetic-four"})
+
+    def test_routed_profile_requires_explicit_database(self):
+        self.settings.pop("db_path", None)
+        with patch("agent.secret_scope.serves_routed_profile", return_value=True):
+            with self.assertRaises(ValueError):
+                impl._db_path(self.settings)
+
+    def test_model_catalog_cache_is_profile_scoped(self):
+        self.responses = [
+            response(body={"data": [{"id": "gemini/profile-one"}]}, content_type="application/json"),
+            response(body={"data": [{"id": "gemini/profile-two"}]}, content_type="application/json"),
+        ]
+        with patch("hermes_constants.get_hermes_home", return_value=self.root / "profile-one"):
+            self.assertEqual(self.provider._fetch_models(), ["gemini/profile-one"])
+        with patch("hermes_constants.get_hermes_home", return_value=self.root / "profile-two"):
+            self.assertEqual(self.provider._fetch_models(), ["gemini/profile-two"])
+            self.assertEqual(self.provider._fetch_models(), ["gemini/profile-two"])
+        self.assertEqual(len(self.calls), 2)
+
+    def test_atomic_replace_failure_preserves_file_and_cleans_temp(self):
+        target = self.root / "speech.mp3"
+        target.write_bytes(b"existing valid file")
+        with patch("os.replace", side_effect=OSError("synthetic disk failure")):
+            with self.assertRaises(OSError):
+                self.synthesize()
+        self.assertEqual(target.read_bytes(), b"existing valid file")
+        self.assertEqual(list(self.root.iterdir()), [target])
+
+    def test_elevenlabs_401_quota_rotates(self):
+        self.elevenlabs()
+        self.responses = [
+            response(401, body={"detail": {"status": "quota_exceeded", "message": "quota"}}),
+            response(),
+        ]
+        self.synthesize(voice="narrator")
+        self.assertEqual([call[3]["headers"]["xi-api-key"] for call in self.calls],
+                         ["synthetic-key-one", "synthetic-key-two"])
+
+    def test_elevenlabs_401_invalid_key_tries_next_mapping(self):
+        self.elevenlabs()
+        self.responses = [
+            response(401, body={"detail": {"status": "invalid_api_key", "message": "denied"}}),
+            response(),
+        ]
+        self.synthesize(voice="narrator")
+        self.assertEqual([call[3]["headers"]["xi-api-key"] for call in self.calls],
+                         ["synthetic-key-one", "synthetic-key-two"])
+
+    def test_round_robin_moves_after_successful_retry(self):
+        path = self.elevenlabs()
+        with sqlite3.connect(path) as writer:
+            writer.execute("INSERT INTO providerConnections VALUES (?, ?, ?, ?, ?)",
+                           ("three", "fixture-three", "elevenlabs", 1, json.dumps({"apiKey": "synthetic-key-three"})))
+        self.settings["elevenlabs"]["voices"]["narrator"].append(
+            {"connection": "fixture-three", "voice_id": "Voice0003"})
+        self.responses = [
+            response(429, body={"detail": {"status": "quota_exceeded", "message": "quota"}}),
+            response(), response(),
+        ]
+        self.synthesize("first.mp3", voice="narrator")
+        self.synthesize("second.mp3", voice="narrator")
+        self.assertEqual([call[3]["headers"]["xi-api-key"] for call in self.calls],
+                         ["synthetic-key-one", "synthetic-key-two", "synthetic-key-three"])
+
+    def test_embedded_proxy_voice_precedes_default_voice(self):
+        self.settings["voice"] = "Kore"
+        self.synthesize(model="gemini/fixture/Puck")
+        self.assertEqual(self.calls[0][3]["json"]["model"], "gemini/fixture/Puck")
+
+    def test_embedded_elevenlabs_voice_precedes_default_alias(self):
+        self.elevenlabs()
+        self.synthesize(model="el/eleven_flash_v2_5/Voice0009")
+        self.assertTrue(self.calls[0][2].endswith("/Voice0009"))
+
+
+    def test_elevenlabs_invalid_model_stops_all_mappings(self):
+        self.elevenlabs()
+        self.responses = [response(400, body={"detail": {"status": "invalid_model_id", "message": "invalid model"}}), response()]
+        with self.assertRaises(RuntimeError):
+            self.synthesize()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_elevenlabs_voice_access_failure_tries_next_mapping(self):
+        self.elevenlabs()
+        self.responses = [response(404, body={"detail": {"status": "voice_not_found", "message": "missing voice"}}), response()]
+        self.synthesize()
+        self.assertEqual(len(self.calls), 2)
+
+    def test_router_voice_specific_lock_excludes_key(self):
+        self.database([
+            ("one", "locked", "elevenlabs", 1, {"apiKey": "synthetic-one",
+                "modelLock_eleven_flash_v2_5/Voice0001": "2999-01-01T00:00:00Z"}),
+            ("two", "eligible", "elevenlabs", 1, {"apiKey": "synthetic-two"}),
+        ])
+        self.assertEqual(self.provider._read_db_keys(model="eleven_flash_v2_5"),
+                         {"eligible": "synthetic-two"})
 
 
 BASELINE_CASES = [

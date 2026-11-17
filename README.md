@@ -93,7 +93,8 @@ A raw voice ID can also select the active pool. Missing keys, disabled connectio
 ambiguous names and active DB quota/model locks are ineligible. Rotation state
 is scoped to the profile, DB, model and current mapping/key identities. Quota
 failures rotate once through eligible entries and cool failed entries for 60 seconds.
-Other errors stop. Credentials, voice IDs and provider error bodies are omitted
+Key-specific authentication or voice-access errors try the next mapping; general
+input/model and transport errors stop. Credentials, voice IDs and provider error bodies are omitted
 from logs and exceptions.
 
 ElevenLabs output format is a query parameter: MP3, true WAV, or Ogg/Opus.

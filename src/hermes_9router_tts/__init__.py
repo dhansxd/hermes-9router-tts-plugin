@@ -347,7 +347,11 @@ class NineRouterTTSProvider(TTSProvider):
                     continue
                 if not isinstance(data, dict):
                     continue
-                locks = ("rateLimitedUntil", "modelLock___all") + (("modelLock_" + model,) if model else ())
+                locks = ["rateLimitedUntil", "modelLock___all"]
+                if model:
+                    prefix = "modelLock_" + model
+                    locks.extend(field for field in data
+                                 if field == prefix or field.startswith(prefix + "/"))
                 if any(_future(data.get(field)) for field in locks):
                     continue
                 key = data.get("apiKey")
@@ -376,11 +380,12 @@ class NineRouterTTSProvider(TTSProvider):
                 state["index"] = (ordered[0] + 1) % len(entries)
             return ordered
 
-    def _el_quota(self, identity, index, count, strategy):
+    def _el_quota(self, identity, index, count, strategy, quota=True):
         with self._state_lock:
             state = self._el_states.get(identity)
             if state is not None:
-                state["cooldown"][index] = time.monotonic() + 60
+                if quota:
+                    state["cooldown"][index] = time.monotonic() + 60
                 if strategy == "fill-first":
                     state["index"] = (index + 1) % count
 
@@ -449,12 +454,18 @@ class NineRouterTTSProvider(TTSProvider):
                         body = response.json()
                     except ValueError:
                         body = {}
-                    if not _is_quota_error(response.status_code, body):
+                    quota = _is_quota_error(response.status_code, body)
+                    detail = body.get("detail") if isinstance(body, dict) else None
+                    code = str(detail.get("status") or "") if isinstance(detail, dict) else ""
+                    # A different account/voice mapping can resolve these failures.
+                    key_specific = (response.status_code in (401, 403)
+                                    or code in ("voice_not_found", "invalid_voice_id", "voice_access_denied"))
+                    if not quota and not key_specific:
                         raise RuntimeError("ElevenLabs synthesis failed (HTTP %s)" % response.status_code)
-                    self._el_quota(identity, index, len(entries), strategy)
+                    self._el_quota(identity, index, len(entries), strategy, quota=quota)
                 finally:
                     response.close()
-        raise RuntimeError("All eligible ElevenLabs connections are quota-limited; retry later")
+        raise RuntimeError("No eligible ElevenLabs mapping succeeded; check key/voice access or retry after quota cooldown")
 
     def _synthesize_9router(self, text, output_path, voice, model, fmt, settings, speed):
         base, key = _base_url(settings), _api_key()
