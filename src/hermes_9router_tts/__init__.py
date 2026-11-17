@@ -135,6 +135,14 @@ def _is_elevenlabs_model(model: Optional[str]) -> bool:
     return _provider(model) == "elevenlabs" or model.split("/", 1)[0].lower().startswith("eleven_")
 
 
+def _elevenlabs_parts(model: str) -> List[str]:
+    parts = model.split("/")
+    remainder = parts[1:] if parts[0].lower() in ("el", "elevenlabs") else parts
+    if not remainder or len(remainder) > 2 or any(not part for part in remainder):
+        raise ValueError("Use elevenlabs/voice_id or elevenlabs/model_id/voice_id")
+    return remainder
+
+
 def _legacy_direct(settings: Dict[str, Any], model: str) -> bool:
     """Recognize local-rotation intent, never a model/voice alone."""
     if not _is_elevenlabs_model(model):
@@ -165,20 +173,22 @@ def _transport(settings: Dict[str, Any], model: Optional[str] = None) -> str:
         if not isinstance(value, str) or value.strip() not in ("gateway", "elevenlabs-direct"):
             raise ValueError("transport must be gateway or elevenlabs-direct")
         selected = value.strip()
-        if selected == "elevenlabs-direct" and not _is_elevenlabs_model(model):
-            raise ValueError("elevenlabs-direct requires an explicit ElevenLabs model")
+        if selected == "elevenlabs-direct":
+            if not _is_elevenlabs_model(model):
+                raise ValueError("elevenlabs-direct requires an explicit ElevenLabs model or voice target")
+            _elevenlabs_parts(model)
         return selected
-    return "elevenlabs-direct" if _legacy_direct(settings, model or "") else "gateway"
+    if _legacy_direct(settings, model or ""):
+        _elevenlabs_parts(model)
+        return "elevenlabs-direct"
+    return "gateway"
 
 
 def _encoded_voice(model: str) -> Optional[str]:
     parts = model.split("/")
     provider = _provider(model)
     if provider == "elevenlabs":
-        if parts[0].lower() in ("el", "elevenlabs"):
-            remainder = parts[1:]
-        else:
-            remainder = parts
+        remainder = _elevenlabs_parts(model)
         if len(remainder) == 2:
             return remainder[1]
         if len(remainder) == 1 and not remainder[0].startswith("eleven_"):
@@ -195,10 +205,7 @@ def _encoded_voice(model: str) -> Optional[str]:
 
 def _request_model(model: str, voice: Optional[str]) -> str:
     if _is_elevenlabs_model(model):
-        parts = model.split("/")
-        remainder = parts[1:] if parts[0].lower() in ("el", "elevenlabs") else parts
-        if not remainder or len(remainder) > 2 or any(not part for part in remainder):
-            raise ValueError("Use elevenlabs/voice_id or elevenlabs/model_id/voice_id")
+        remainder = _elevenlabs_parts(model)
         voice = voice or _encoded_voice(model)
         if not voice:
             raise ValueError("An ElevenLabs model requires a voice_id for gateway synthesis")

@@ -96,8 +96,9 @@ tts:
             voice_id: your_elevenlabs_voice_id_2
 ```
 
-Direct mode requires an explicit ElevenLabs model. A missing or non-ElevenLabs
-model is rejected before any catalog, DB or provider request. It never uses the
+Direct mode requires an explicit ElevenLabs target: a model ID or voice-only
+shorthand. A missing/non-ElevenLabs target, empty segments, extra segments or a
+bare provider namespace is rejected before any catalog, DB or provider request. It never uses the
 gateway URL or `NINEROUTER_KEY` for synthesis.
 
 Keys are read at synthesis time from the local 9Router SQLite database, default

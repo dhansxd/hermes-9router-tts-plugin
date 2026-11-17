@@ -740,6 +740,20 @@ class Regressions(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+    def test_malformed_direct_targets_fail_before_any_io(self):
+        for model in ("el", "elevenlabs", "elevenlabs/", "el//Voice0009",
+                      "el/eleven_flash_v2_5/", "el/model/voice/extra"):
+            with self.subTest(model=model):
+                self.settings = {"transport": "elevenlabs-direct", "model": model,
+                                 "voice": "narrator", "db_path": "/synthetic/legacy.sqlite"}
+                with patch.object(self.provider, "_read_db_keys", side_effect=AssertionError("Malformed target opened DB")), \
+                     patch.object(self.provider, "_fetch_models", side_effect=AssertionError("Malformed target fetched catalog")), \
+                     patch("sqlite3.connect", side_effect=AssertionError("Malformed target opened SQLite")):
+                    with self.assertRaises(ValueError):
+                        self.synthesize()
+                self.assertEqual(self.calls, [])
+
+
 BASELINE_CASES = [
     "test_default_voice_is_applied",
     "test_voice_is_encoded_in_router_model",
