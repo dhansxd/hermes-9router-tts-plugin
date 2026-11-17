@@ -57,7 +57,9 @@ ElevenLabs gateway inputs accept `el/model/voice`,
 `elevenlabs/model/voice`, and voice-only `el/voice_id` or
 `elevenlabs/voice_id`. A bare `eleven_*` model is normalized to
 `elevenlabs/model/voice`; model-only forms require a caller/default voice.
-An explicit caller voice replaces only the voice part. Empty or extra model
+An explicit caller voice replaces only the voice part. Each ElevenLabs fallback
+keeps its encoded voice unless a caller override is supplied; model-only fallbacks
+retain the resolved request voice. Empty or extra model
 segments fail clearly. Gemini/OpenAI use `provider/model/voice`, OpenRouter
 uses `openrouter/provider/model/voice`, and Edge/Google use `provider/voice`.
 The separate voice field is also sent for compatible gateways; other adapters
@@ -104,6 +106,8 @@ explicit `db_path` under `tts.9router-tts`. The reader uses read-only SQLite
 with WAL visibility, creates no missing DB, modifies no 9Router data and caches
 no credentials. Requests go to the fixed official ElevenLabs API.
 
+Direct mode keeps the previous alias behavior: a configured alias remains active
+for a two-part `el/value` model; use `el/model/voice` to embed a direct voice.
 Mappings retain each unique active connection name's matching voice ID.
 A raw voice ID can also use the active pool. Missing/revoked keys, ambiguous
 names and active quota/model locks are excluded. Rotation state is scoped to

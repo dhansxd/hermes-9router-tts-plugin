@@ -315,7 +315,9 @@ class NineRouterTTSProvider(TTSProvider):
         return models[0] if models else None
 
     def list_models(self) -> List[Dict[str, Any]]:
-        return [{"id": model, "display": model} for model in self._fetch_models()]
+        settings = _load_settings()
+        _transport(settings, str(settings.get("model") or "").strip())
+        return [{"id": model, "display": model} for model in self._fetch_models(settings)]
 
     def list_voices(self) -> List[Dict[str, Any]]:
         settings = _load_settings()
@@ -527,17 +529,21 @@ class NineRouterTTSProvider(TTSProvider):
                     response.close()
         raise RuntimeError("No eligible ElevenLabs mapping succeeded; check key/voice access or retry after quota cooldown")
 
-    def _synthesize_9router(self, text, output_path, voice, model, fmt, settings, speed):
+    def _synthesize_9router(self, text, output_path, voice, model, fmt, settings, speed, caller_voice=None):
         base, key = _base_url(settings), _api_key()
         chain = self._model_chain(model, settings, key)
         if not chain:
             raise ValueError("No TTS model configured or available from 9Router")
         headers = {"Authorization": "Bearer " + key} if key else {}
         for model_id in chain:
-            payload = {"model": _request_model(model_id, voice), "input": text,
+            request_voice = voice
+            if _is_elevenlabs_model(model_id):
+                # A fallback may encode its own voice; only a caller override wins.
+                request_voice = caller_voice or _encoded_voice(model_id) or voice
+            payload = {"model": _request_model(model_id, request_voice), "input": text,
                        "response_format": fmt if fmt in _FORMATS else "mp3"}
-            if voice:
-                payload["voice"] = voice
+            if request_voice:
+                payload["voice"] = request_voice
             if speed is not None:
                 payload["speed"] = speed
             with _session() as session:
@@ -596,7 +602,13 @@ class NineRouterTTSProvider(TTSProvider):
         if not model:
             raise ValueError("No TTS model configured or available from 9Router")
         transport = _transport(settings, model)
-        voice = (voice or _encoded_voice(model)
+        caller_voice = voice
+        embedded_voice = _encoded_voice(model)
+        parts = model.split("/")
+        if transport == "elevenlabs-direct" and parts[0].lower() in ("el", "elevenlabs") and len(parts) == 2:
+            # Preserve direct-mode alias selection from pre-0.1.2 configurations.
+            embedded_voice = None
+        voice = (voice or embedded_voice
                  or str(settings.get("voice") or settings.get("default_voice") or "").strip() or None)
         if voice and ("/" in voice or any(ord(c) < 32 for c in voice)):
             raise ValueError("voice must be a single voice ID or alias")
@@ -609,7 +621,8 @@ class NineRouterTTSProvider(TTSProvider):
         self._notice_implicit_transport(settings, model, transport)
         if transport == "elevenlabs-direct":
             return self._synthesize_elevenlabs(text, output_path, voice, model, fmt, settings, speed)
-        return self._synthesize_9router(text, output_path, voice, model, fmt, settings, speed)
+        return self._synthesize_9router(text, output_path, voice, model, fmt, settings, speed,
+                                        caller_voice=caller_voice)
 
     def stream(self, text: str, *, voice: Optional[str] = None, model: Optional[str] = None,
                format: str = "opus", **extra: Any) -> Iterator[bytes]:

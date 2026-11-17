@@ -704,6 +704,42 @@ class Regressions(unittest.TestCase):
             self.assertNotIn(private, notice)
 
 
+    def test_gateway_fallback_preserves_encoded_voice_unless_caller_overrides(self):
+        self.settings = {"transport": "gateway", "model": "el/eleven_flash_v2_5/VoicePrimary",
+                         "fallback_models": ["el/eleven_turbo_v2_5/VoiceFallback"]}
+        for override in (None, "VoiceCaller"):
+            with self.subTest(override=override):
+                self.calls.clear()
+                self.responses = [response(429), response()]
+                self.synthesize(voice=override)
+                expected = [override or "VoicePrimary", override or "VoiceFallback"]
+                self.assertEqual([call[3]["json"]["voice"] for call in self.calls], expected)
+                self.assertEqual([call[3]["json"]["model"].split("/")[-1] for call in self.calls], expected)
+
+    def test_direct_voice_only_model_preserves_existing_account_alias(self):
+        self.elevenlabs()
+        self.settings["model"] = "el/RawVoicePrivate"
+        self.responses = [response(), response()]
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                if not explicit:
+                    self.settings.pop("transport")
+                self.synthesize("alias-%s.mp3" % explicit)
+                key = self.calls[-1][3]["headers"]["xi-api-key"]
+                expected = {"synthetic-key-one": "Voice0001", "synthetic-key-two": "Voice0002"}
+                self.assertTrue(self.calls[-1][2].endswith("/" + expected[key]))
+
+    def test_catalog_methods_validate_transport_before_network(self):
+        for settings in ({"transport": "unknown"},
+                         {"transport": "elevenlabs-direct", "model": "gemini/fixture"}):
+            with self.subTest(settings=settings):
+                self.settings = settings
+                with patch.object(self.provider, "_fetch_models", side_effect=AssertionError("Invalid mode fetched catalog")):
+                    with self.assertRaises(ValueError):
+                        self.provider.list_models()
+        self.assertEqual(self.calls, [])
+
+
 BASELINE_CASES = [
     "test_default_voice_is_applied",
     "test_voice_is_encoded_in_router_model",
