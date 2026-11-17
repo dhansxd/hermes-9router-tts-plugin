@@ -38,13 +38,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="tts-lifecycle-") as tmp:
         root = Path(tmp)
         home = root / "profile"
-        user_home = root / "home"
         home.mkdir()
-        user_home.mkdir()
-        # Set both homes before importing any Hermes module. No existing profile,
-        # credential pool, netrc or local 9Router database is visible to the test.
+        # Isolate the Hermes profile before importing host modules.
+        # Native proxy synthesis uses no local 9Router database.
         os.environ["HERMES_HOME"] = str(home)
-        os.environ["HOME"] = str(user_home)
         for key in ("NINEROUTER_KEY", "NINEROUTER_URL", "ELEVENLABS_API_KEY"):
             os.environ.pop(key, None)
 
