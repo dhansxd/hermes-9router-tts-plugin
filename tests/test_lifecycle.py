@@ -62,6 +62,7 @@ def main():
                 assert (provider is not None) == present
                 if provider is not None:
                     assert provider.is_available()
+                    assert provider.voice_compatible is True
             return provider
 
         cli("install", "dhansxd/hermes-9router-tts-plugin", "--ref", revision, "--enable", "--yes-deps")
@@ -123,9 +124,9 @@ def main():
             assert check_tts_requirements()
             result = json.loads(text_to_speech_tool("Native cloud speech", str(output)))
         assert result["success"] and result["provider"] == "9router-tts", result
-        assert result["voice_compatible"] is True, result
         written = Path(result["file_path"])
         assert written.is_file(), result
+        assert result["voice_compatible"] == (written.suffix == ".ogg"), result
         if written.suffix == ".wav":
             assert written == output and written.read_bytes() == audio_bytes
         else:
