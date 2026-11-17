@@ -1,0 +1,58 @@
+name: TTS cloud checks
+on:
+  push:
+    branches: [main, audit/tts-20261118]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: tts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  stable-hermes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HERMES_HOME: ${{ github.workspace }}/.ci-hermes-home
+      HERMES_DISABLE_LAZY_INSTALLS: "1"
+      PYTHONPATH: ${{ github.workspace }}/hermes
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: dhansxd/hermes-9router-tts-plugin
+          ref: 8379895da2f73eb6899ac35b01e716a8c2c413b4
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ae2a81ccc00e9b7c06301523e5bb09608397149c
+          path: hermes
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.12.13"
+          enable-cache: false
+      - name: Install official locked minimal Hermes runtime
+        working-directory: hermes
+        run: uv sync --locked --python 3.14 --no-dev
+      - name: Check original baseline
+        run: hermes/.venv/bin/python baseline/test_provider.py
+      - name: Reproduce original defects
+        env:
+          PLUGIN_SOURCE: ${{ github.workspace }}/baseline
+        run: hermes/.venv/bin/python plugin/tests/test_regressions.py --baseline
+      - name: Check fixed offline regressions
+        run: hermes/.venv/bin/python plugin/tests/test_regressions.py
+      - name: Check actual Hermes lifecycle and native TTS dispatch
+        env:
+          TTS_CLOUD_TESTS: "1"
+          PLUGIN_REVISION: ${{ github.sha }}
+        run: hermes/.venv/bin/python plugin/tests/test_lifecycle.py
+      - name: Verify unchanged Hermes source
+        working-directory: hermes
+        run: git diff --exit-code
