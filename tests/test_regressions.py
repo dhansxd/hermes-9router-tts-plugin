@@ -754,6 +754,18 @@ class Regressions(unittest.TestCase):
                 self.assertEqual(self.calls, [])
 
 
+    def test_direct_voice_only_target_without_default_uses_embedded_voice(self):
+        self.elevenlabs()
+        self.settings.pop("voice")
+        self.responses = [response(), response()]
+        for model in ("el/Voice0009", "elevenlabs/Voice0009"):
+            with self.subTest(model=model):
+                self.synthesize(model=model)
+                self.assertTrue(self.calls[-1][2].endswith("/Voice0009"))
+                self.assertIn(self.calls[-1][3]["headers"]["xi-api-key"],
+                              ("synthetic-key-one", "synthetic-key-two"))
+
+
 BASELINE_CASES = [
     "test_default_voice_is_applied",
     "test_voice_is_encoded_in_router_model",

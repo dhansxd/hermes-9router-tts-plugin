@@ -610,13 +610,13 @@ class NineRouterTTSProvider(TTSProvider):
             raise ValueError("No TTS model configured or available from 9Router")
         transport = _transport(settings, model)
         caller_voice = voice
+        configured_voice = str(settings.get("voice") or settings.get("default_voice") or "").strip() or None
         embedded_voice = _encoded_voice(model)
         parts = model.split("/")
         if transport == "elevenlabs-direct" and parts[0].lower() in ("el", "elevenlabs") and len(parts) == 2:
-            # Preserve direct-mode alias selection from pre-0.1.2 configurations.
-            embedded_voice = None
-        voice = (voice or embedded_voice
-                 or str(settings.get("voice") or settings.get("default_voice") or "").strip() or None)
+            # Preserve an old configured alias, or use the voice-only shorthand.
+            embedded_voice = configured_voice or embedded_voice
+        voice = voice or embedded_voice or configured_voice
         if voice and ("/" in voice or any(ord(c) < 32 for c in voice)):
             raise ValueError("voice must be a single voice ID or alias")
         if speed is not None:

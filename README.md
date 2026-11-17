@@ -108,7 +108,8 @@ with WAL visibility, creates no missing DB, modifies no 9Router data and caches
 no credentials. Requests go to the fixed official ElevenLabs API.
 
 Direct mode keeps the previous alias behavior: a configured alias remains active
-for a two-part `el/value` model; use `el/model/voice` to embed a direct voice.
+for a two-part `el/value` model; without a configured/caller voice, the shorthand's
+voice ID is used. Use `el/model/voice` to embed a direct voice ahead of an alias.
 Mappings retain each unique active connection name's matching voice ID.
 A raw voice ID can also use the active pool. Missing/revoked keys, ambiguous
 names and active quota/model locks are excluded. Rotation state is scoped to
