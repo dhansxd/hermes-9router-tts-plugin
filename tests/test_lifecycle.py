@@ -95,7 +95,7 @@ def main():
         fixture = root / "fixture.wav"
         with wave.open(str(fixture), "wb") as audio:
             audio.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
-            audio.writeframes(b"\\0\\0" * 1920)
+            audio.writeframes(bytes(2 * 1920))
         audio_bytes = fixture.read_bytes()
         assert audio_bytes.startswith(b"RIFF")
         output = root / "native.wav"
