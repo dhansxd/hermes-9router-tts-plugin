@@ -1,122 +1,219 @@
-"""9Router TTS backend for Hermes Agent.
+"""Native Hermes TTS via 9Router, with optional local ElevenLabs key rotation.
 
-Two paths:
-  - Elevenlabs: direct API call with per-key voice_id mapping + round-robin.
-    Keys read from 9Router DB (providerConnections table). Voice mapping from config.
-  - Everything else (Gemini, OpenAI, Edge, etc.): proxy to 9Router /v1/audio/speech.
-
-Config (``tts.9router-tts`` in config.yaml):
-    base_url          — 9Router gateway URL (default: NINEROUTER_URL or http://localhost:20128)
-    model             — default model id (determines active provider)
-    fallback_models   — tried in order on 429/quota (same provider only)
-    timeout           — per-request seconds (default 120)
-    voice             — default voice alias
-    db_path           — 9Router SQLite DB (default: ~/.9router/db/data.sqlite)
-    elevenlabs:
-      model_id        — ElevenLabs model (default: eleven_flash_v2_5)
-      voices:
-        <alias>:
-          - connection: <connection_name_in_9router>
-            voice_id: <elevenlabs_voice_id>
-          - connection: <another_name>
-            voice_id: <another_voice_id>
-
-Secret: NINEROUTER_KEY (.env) for 9Router proxy path. ElevenLabs keys come from 9Router DB.
+No I/O at import or registration. Settings are read for each call from the active
+Hermes profile. Only explicit fallback models and quota failures are retried.
 """
-
 from __future__ import annotations
 
-import itertools
+import base64
+from datetime import datetime
+import hashlib
+import ipaddress
 import json
 import logging
+import math
 import os
-import sqlite3
-import time
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+import sqlite3
+import tempfile
+import threading
+import time
+from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import quote, urlsplit
 
 from agent.tts_provider import TTSProvider
 
 logger = logging.getLogger(__name__)
-
 DEFAULT_BASE_URL = "http://localhost:20128"
 DEFAULT_TIMEOUT = 120
 DEFAULT_EL_MODEL = "eleven_flash_v2_5"
 DEFAULT_EL_API = "https://api.elevenlabs.io"
 _MODELS_CACHE_TTL = 300.0
-_DB_KEY_CACHE_TTL = 600.0
+_FORMATS = {"mp3": "mp3", "wav": "wav", "ogg": "ogg", "opus": "opus", "flac": "flac"}
 
 
 def _load_settings() -> Dict[str, Any]:
-    try:
-        from hermes_cli.config import load_config
-    except ImportError:
-        return {}
+    from hermes_cli.config import load_config
+
     cfg = load_config() or {}
-    scoped = cfg.get("tts") if isinstance(cfg, dict) else None
-    scoped = scoped.get("9router-tts") if isinstance(scoped, dict) else None
-    return scoped if isinstance(scoped, dict) else {}
+    tts = cfg.get("tts") if isinstance(cfg, dict) else None
+    if not isinstance(tts, dict):
+        return {}
+    legacy, canonical = tts.get("9router"), tts.get("9router-tts")
+    result = dict(legacy) if isinstance(legacy, dict) else {}
+    if isinstance(canonical, dict):
+        result.update(canonical)
+    return result
 
 
-def _base_url(settings: Dict[str, Any]) -> str:
-    url = (
-        str(settings.get("base_url") or "").strip()
-        or os.environ.get("NINEROUTER_URL", "").strip()
-        or DEFAULT_BASE_URL
-    )
-    return url.rstrip("/")
+def _scoped_env(name: str) -> str:
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.environ.get(name, "").strip()
+    return str(get_secret(name) or "").strip()
 
 
 def _api_key() -> str:
+    return _scoped_env("NINEROUTER_KEY")
+
+
+def _base_url(settings: Dict[str, Any]) -> str:
+    value = (str(settings.get("base_url") or "").strip()
+             or _scoped_env("NINEROUTER_URL") or DEFAULT_BASE_URL).rstrip("/")
+    parts = urlsplit(value)
+    if (parts.scheme not in ("http", "https") or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.query or parts.fragment):
+        raise ValueError("base_url must be an HTTP(S) URL without credentials, query or fragment")
+    return value
+
+
+def _profile() -> str:
+    from hermes_constants import get_hermes_home
+    return str(get_hermes_home().resolve())
+
+
+def _db_path(settings: Dict[str, Any]) -> Path:
+    # Local keys must never be borrowed for a remote gateway or routed profile.
+    host = urlsplit(_base_url(settings)).hostname
     try:
-        from agent.secret_scope import get_secret
-        key = get_secret("NINEROUTER_KEY")
-        if key:
-            return str(key)
-    except Exception:
-        pass
-    return os.environ.get("NINEROUTER_KEY", "").strip()
-
-
-def _db_path(settings: Dict[str, Any]) -> str:
+        local = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = host == "localhost"
+    if not local:
+        raise ValueError("ElevenLabs DB access requires a loopback 9Router URL")
     explicit = str(settings.get("db_path") or "").strip()
     if explicit:
-        return explicit
-    return str(Path.home() / ".9router" / "db" / "data.sqlite")
+        return Path(explicit).expanduser().resolve()
+    from agent.secret_scope import serves_routed_profile
+    from hermes_constants import get_hermes_home, named_profile_home
+    if serves_routed_profile() or named_profile_home(get_hermes_home()) is not None:
+        raise ValueError("Set this profile's explicit db_path for local ElevenLabs access")
+    return Path.home() / ".9router" / "db" / "data.sqlite"
 
 
-def _is_quota_error(status_code: int, body: Any) -> bool:
-    if status_code == 429:
+def _session():
+    import requests
+    session = requests.Session()
+    # Do not send speech or keys through ambient proxies or replace auth with netrc.
+    session.trust_env = False
+    return session
+
+
+def _timeout(settings: Dict[str, Any]) -> float:
+    value = float(settings.get("timeout", DEFAULT_TIMEOUT))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("timeout must be positive and finite")
+    return value
+
+
+def _is_quota_error(status: int, body: Any) -> bool:
+    if status == 429:
         return True
+    if status not in (402, 403, 500, 502, 503):
+        return False
     if not isinstance(body, dict):
         return False
-    err = body.get("error")
-    if isinstance(err, dict):
-        msg = str(err.get("message") or "").lower()
-        code = str(err.get("code") or "").lower()
-        return ("429" in msg or "quota" in msg or "rate" in msg and "limit" in msg
-                or code in ("429", "rate_limit_exceeded", "insufficient_quota"))
-    return False
+    err = body.get("error") or body.get("detail")
+    if not isinstance(err, dict):
+        return False
+    message = str(err.get("message") or "").lower()
+    code = str(err.get("code") or err.get("status") or "").lower()
+    if "not allowed to use model" in message or "do not have permission" in message:
+        return False
+    if status == 403:
+        return "quota" in message or "rate limit" in message
+    return ("quota" in message or "rate limit" in message
+            or code in ("quota_exceeded", "rate_limit_exceeded", "insufficient_quota", "429"))
+
+
+def _provider(model: str) -> str:
+    prefix = model.split("/", 1)[0].lower()
+    return {"gm": "gemini", "oa": "openai", "el": "elevenlabs"}.get(prefix, prefix)
 
 
 def _is_elevenlabs_model(model: Optional[str]) -> bool:
-    """Check if model string indicates ElevenLabs provider."""
     if not model:
         return False
-    m = model.lower().strip()
-    return (m.startswith("eleven") or m.startswith("el/")
-            or "elevenlabs" in m or "/eleven" in m)
+    return _provider(model) == "elevenlabs" or model.split("/", 1)[0].lower().startswith("eleven_")
+
+
+def _request_model(model: str, voice: Optional[str]) -> str:
+    if not voice:
+        return model
+    # 9Router 0.5.119 consumes the voice inside model, not body.voice.
+    provider, sep, remainder = model.partition("/")
+    canonical = _provider(model)
+    if canonical in ("gemini", "openai", "openrouter"):
+        if not sep:
+            raise ValueError("Use provider/model when selecting a voice")
+        if canonical == "openrouter":
+            segments = remainder.split("/")
+            # OpenRouter models are themselves namespaced (e.g. openai/model).
+            model_part = "/".join(segments[:2])
+        else:
+            model_part = remainder.split("/", 1)[0]
+        return provider + "/" + model_part + "/" + voice
+    if canonical in ("edge", "edge-tts", "google", "google-tts", "local-device"):
+        return provider + "/" + voice
+    # Other adapters have their own model grammar; keep it intact.
+    return model
+
+
+def _audio_response(response, requested_format):
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if content_type == "application/json":
+        try:
+            body = response.json()
+            return base64.b64decode(body["audio"], validate=True), body["format"]
+        except (KeyError, ValueError, TypeError):
+            raise RuntimeError("9Router returned invalid audio data") from None
+    actual = {"audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/wav": "wav",
+              "audio/x-wav": "wav", "audio/ogg": "ogg", "audio/opus": "opus",
+              "audio/flac": "flac"}.get(content_type)
+    if actual is None:
+        raise RuntimeError("9Router returned an unsupported audio response")
+    return response.content, actual
+
+
+def _future(value):
+    if not value:
+        return False
+    try:
+        if isinstance(value, (int, float)):
+            return value / 1000 > time.time()
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() > time.time()
+    except (ValueError, TypeError, OverflowError):
+        return True  # Unknown eligibility must not expose a key.
+
+
+def _write_audio(output_path: str, audio: bytes, actual_format: str) -> str:
+    fmt = _FORMATS.get(str(actual_format).lower())
+    if fmt is None or not audio:
+        raise RuntimeError("TTS returned empty audio or an unsupported audio format")
+    path = Path(output_path)
+    if path.suffix.lower() != "." + fmt:
+        path = path.with_suffix("." + fmt)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".tts-", delete=False) as handle:
+            temporary = handle.name
+            handle.write(audio)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+    return str(path)
 
 
 class NineRouterTTSProvider(TTSProvider):
-    """TTS through 9Router (general) or ElevenLabs direct (multi-key rotation)."""
-
     def __init__(self) -> None:
-        self._models_cache: Optional[Tuple[List[str], float]] = None
-        # State per voice alias for load balancing
-        self._el_states: Dict[str, Dict[str, Any]] = {}
-        # Cached DB keys: {connection_name: api_key}
-        self._db_keys_cache: Optional[Tuple[Dict[str, str], float]] = None
+        self._models_cache = None
+        self._models_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._el_states = {}
 
     @property
     def name(self) -> str:
@@ -143,365 +240,266 @@ class NineRouterTTSProvider(TTSProvider):
 
     def default_model(self) -> Optional[str]:
         settings = _load_settings()
-        model = str(settings.get("model") or "").strip()
-        if model:
-            return model
-        models = self._fetch_models()
+        configured = str(settings.get("model") or "").strip()
+        if configured:
+            return configured
+        models = self._fetch_models(settings)
         return models[0] if models else None
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        return [{"id": model, "display": model} for model in self._fetch_models()]
 
     def list_voices(self) -> List[Dict[str, Any]]:
         settings = _load_settings()
-        el_config = settings.get("elevenlabs") or {}
-        voices_map = el_config.get("voices") or {}
-        result = []
-        for alias, entries in voices_map.items():
-            if isinstance(entries, list) and entries:
-                result.append({
-                    "id": alias,
-                    "display": alias,
-                    "provider": "elevenlabs",
-                    "entries": len(entries),
-                })
-        return result
+        el = settings.get("elevenlabs")
+        voices = el.get("voices") if isinstance(el, dict) else None
+        if not isinstance(voices, dict):
+            return []
+        return [{"id": alias, "display": alias, "provider": "elevenlabs"}
+                for alias, entries in voices.items() if isinstance(entries, list) and entries]
 
     def get_setup_schema(self) -> Dict[str, Any]:
-        return {
-            "name": "9Router TTS",
-            "badge": "",
-            "tag": "TTS via 9Router + ElevenLabs direct multi-key rotation",
-            "env_vars": [
-                {"key": "NINEROUTER_KEY", "prompt": "9Router API key (skip for auth-free local gateway)"},
-            ],
-        }
+        return {"name": "9Router TTS", "badge": "",
+                "tag": "9Router speech and optional local ElevenLabs rotation",
+                "env_vars": [{"key": "NINEROUTER_KEY",
+                              "prompt": "9Router API key (optional for an auth-free local gateway)"}]}
 
-    # ── Model catalog (9Router) ──────────────────────────────────────────
-
-    def _fetch_models(self) -> List[str]:
-        if self._models_cache and time.monotonic() - self._models_cache[1] < _MODELS_CACHE_TTL:
-            return self._models_cache[0]
-        settings = _load_settings()
-        base = _base_url(settings)
-        headers = {"Authorization": f"Bearer {_api_key()}"} if _api_key() else {}
+    def _fetch_models(self, settings=None, api_key=None) -> List[str]:
         try:
-            import requests
-            resp = requests.get(f"{base}/v1/models/tts", headers=headers, timeout=15)
-            body = resp.json()
-            models = [
-                str(e.get("id")) for e in (body.get("data") or [])
-                if isinstance(e, dict) and e.get("id")
-            ]
-            self._models_cache = (models, time.monotonic())
-            return models
-        except Exception as exc:
-            logger.debug("9Router TTS model catalog unavailable: %s", exc)
+            settings = _load_settings() if settings is None else settings
+            base = _base_url(settings)
+            key = _api_key() if api_key is None else api_key
+            identity = (_profile(), base, hashlib.sha256(key.encode()).digest())
+            with self._models_lock:
+                cached = self._models_cache
+                if cached and cached[0] == identity and time.monotonic() - cached[2] < _MODELS_CACHE_TTL:
+                    return list(cached[1])
+                with _session() as session:
+                    response = session.get(base + "/v1/models/tts",
+                                           headers={"Authorization": "Bearer " + key} if key else {},
+                                           timeout=15, allow_redirects=False)
+                    try:
+                        if response.status_code != 200:
+                            return []
+                        body = response.json()
+                        entries = body.get("data") if isinstance(body, dict) else None
+                        if not isinstance(entries, list):
+                            return []
+                        models = list(dict.fromkeys(
+                            e["id"].strip() for e in entries if isinstance(e, dict)
+                            and isinstance(e.get("id"), str) and e["id"].strip()))
+                    finally:
+                        response.close()
+                self._models_cache = (identity, tuple(models), time.monotonic())
+                return models
+        except Exception:
+            logger.debug("9Router TTS model catalog unavailable")
             return []
 
-    def _model_chain(self, model_arg: Optional[str]) -> List[str]:
-        settings = _load_settings()
-        chain: List[str] = []
-        for candidate in (
-            model_arg,
-            str(settings.get("model") or "").strip(),
-        ):
-            if candidate and candidate not in chain:
-                chain.append(candidate)
-        raw = settings.get("fallback_models")
+    def _model_chain(self, model_arg, settings=None, api_key=None) -> List[str]:
+        settings = _load_settings() if settings is None else settings
+        primary = str(model_arg or settings.get("model") or "").strip()
+        if not primary:
+            models = self._fetch_models(settings, api_key)
+            primary = models[0] if models else ""
+        if not primary:
+            return []
+        raw = settings.get("fallback_models") or []
         if isinstance(raw, str):
             raw = [raw]
-        for candidate in raw or []:
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError("fallback_models must be a list or string")
+        result = [primary]
+        for candidate in raw:
             candidate = str(candidate).strip()
-            if candidate and candidate not in chain:
-                chain.append(candidate)
-        if not chain:
-            models = self._fetch_models()
-            if models:
-                chain.append(models[0])
-        return chain
+            if candidate and candidate not in result and _provider(candidate) == _provider(primary):
+                result.append(candidate)
+        return result
 
-    # ── 9Router DB key reader ────────────────────────────────────────────
-
-    def _read_db_keys(self, provider: str = "elevenlabs") -> Dict[str, str]:
-        """Read API keys from 9Router providerConnections DB. Returns {connection_name: api_key}."""
-        now = time.monotonic()
-        if self._db_keys_cache and now - self._db_keys_cache[1] < _DB_KEY_CACHE_TTL:
-            return self._db_keys_cache[0]
-        settings = _load_settings()
+    def _read_db_keys(self, provider="elevenlabs", settings=None, model=None) -> Dict[str, str]:
+        settings = _load_settings() if settings is None else settings
         db = _db_path(settings)
-        keys: Dict[str, str] = {}
+        keys = {}
         try:
-            conn = sqlite3.connect(db)
-            rows = conn.execute(
-                "SELECT name, data FROM providerConnections WHERE provider = ? AND isActive = 1",
-                (provider,),
-            ).fetchall()
-            conn.close()
-            for name, data_str in rows:
+            # mode=ro prevents creating a missing DB; regular read-only mode sees WAL.
+            connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=2)
+            try:
+                rows = connection.execute(
+                    "SELECT name, data FROM providerConnections WHERE provider = ? AND isActive = 1",
+                    (provider,)).fetchall()
+            finally:
+                connection.close()
+            duplicates = set()
+            for name, raw in rows:
                 try:
-                    data = json.loads(data_str)
-                    api_key = data.get("apiKey")
-                    if api_key and name:
-                        keys[name] = api_key
-                except (json.JSONDecodeError, TypeError):
+                    data = json.loads(raw)
+                except (ValueError, TypeError):
                     continue
-        except Exception as exc:
-            logger.warning("Failed to read 9Router DB at %s: %s", db, exc)
-        self._db_keys_cache = (keys, now)
+                if not isinstance(data, dict):
+                    continue
+                locks = ("rateLimitedUntil", "modelLock___all") + (("modelLock_" + model,) if model else ())
+                if any(_future(data.get(field)) for field in locks):
+                    continue
+                key = data.get("apiKey")
+                if not isinstance(name, str) or not isinstance(key, str) or not key.strip():
+                    continue
+                if name in keys:
+                    duplicates.add(name)
+                keys[name] = key.strip()
+            # A name must unambiguously identify a single connection.
+            for name in duplicates:
+                keys.pop(name, None)
+        except sqlite3.Error:
+            logger.debug("Local 9Router ElevenLabs keys unavailable")
         return keys
 
-    # ── ElevenLabs direct path ───────────────────────────────────────────
+    def _el_order(self, identity, entries, strategy):
+        with self._state_lock:
+            if len(self._el_states) >= 64 and identity not in self._el_states:
+                self._el_states.clear()
+            state = self._el_states.setdefault(identity, {"index": 0, "cooldown": {}})
+            now = time.monotonic()
+            available = [i for i in range(len(entries)) if state["cooldown"].get(i, 0) <= now]
+            start = state["index"] % len(entries)
+            ordered = sorted(available, key=lambda i: (i - start) % len(entries))
+            if ordered and strategy == "round-robin":
+                state["index"] = (ordered[0] + 1) % len(entries)
+            return ordered
 
-    def _resolve_el_entries(self, voice: Optional[str]) -> List[Dict[str, str]]:
-        """Resolve voice alias to list of {connection, voice_id} entries."""
-        settings = _load_settings()
-        el_config = settings.get("elevenlabs") or {}
-        voices_map = el_config.get("voices") or {}
+    def _el_quota(self, identity, index, count):
+        with self._state_lock:
+            state = self._el_states.get(identity)
+            if state is not None:
+                state["cooldown"][index] = time.monotonic() + 60
+                state["index"] = (index + 1) % count
 
-        # If voice matches an alias, return its entries
-        if voice and voice in voices_map:
-            entries = voices_map[voice]
-            if isinstance(entries, list):
-                return entries
-
-        # If voice looks like a raw voice_id, wrap it for all connections
-        if voice:
-            db_keys = self._read_db_keys()
-            return [{"connection": name, "voice_id": voice} for name in db_keys]
-
-        # Fallback: use default_voice alias
-        default = self.default_voice()
-        if default and default in voices_map:
-            entries = voices_map[default]
-            if isinstance(entries, list):
-                return entries
-
-        return []
-
-    def _el_pick_entry(self, voice_alias: str, entries: List[Dict[str, str]]) -> Dict[str, str]:
-        """Pick next entry based on strategy (fill-first or round-robin)."""
-        settings = _load_settings()
-        el_config = settings.get("elevenlabs") or {}
-        strategy = str(el_config.get("strategy", "fill-first")).lower().strip()
-
-        if voice_alias not in self._el_states:
-            self._el_states[voice_alias] = {"index": 0, "robin": itertools.cycle(entries)}
-
-        state = self._el_states[voice_alias]
-
-        if strategy == "round-robin":
-            return next(state["robin"])
-        else:
-            # fill-first: stick to current index until it fails
-            idx = state.get("index", 0) % len(entries)
-            return entries[idx]
-
-    def _el_advance(self, voice_alias: str, entries: List[Dict[str, str]]) -> None:
-        """Advance fill-first to next entry (called on failure)."""
-        if voice_alias not in self._el_states:
-            return
-        state = self._el_states[voice_alias]
-        state["index"] = (state.get("index", 0) + 1) % len(entries)
-
-    def _synthesize_elevenlabs(
-        self, text: str, output_path: str, voice: Optional[str],
-        model_id: Optional[str], fmt: str,
-    ) -> str:
-        import requests
-
-        settings = _load_settings()
-        el_config = settings.get("elevenlabs") or {}
-        timeout = int(settings.get("timeout") or DEFAULT_TIMEOUT)
-
-        # Resolve model_id: strip el/ prefix, extract model part if model/voice format
-        if model_id:
-            m = model_id.strip()
-            if m.startswith("el/"):
-                m = m[3:]
-            # If format is model_id/voice_id, split
-            if "/" in m:
-                parts = m.split("/", 1)
-                m = parts[0]
-                # If no explicit voice, use voice from model string
-                if not voice:
-                    voice = parts[1]
-            model_id = m
-        if not model_id or not model_id.startswith("eleven"):
-            model_id = el_config.get("model_id", DEFAULT_EL_MODEL)
-
-        entries = self._resolve_el_entries(voice)
+    def _synthesize_elevenlabs(self, text, output_path, voice, model, fmt, settings, speed):
+        el = settings.get("elevenlabs") or {}
+        if not isinstance(el, dict):
+            raise ValueError("elevenlabs must be a mapping")
+        parts = model.split("/")
+        if parts[0].lower() in ("el", "elevenlabs"):
+            parts = parts[1:]
+        model_id = parts[0] if parts and parts[0].startswith("eleven_") else str(el.get("model_id") or DEFAULT_EL_MODEL)
+        voice = voice or (parts[1] if len(parts) > 1 else None)
+        voices = el.get("voices") or {}
+        if not isinstance(voices, dict):
+            raise ValueError("elevenlabs.voices must be a mapping")
+        keys = self._read_db_keys(settings=settings, model=model_id)
+        configured = voices.get(voice) if voice in voices else None
+        if configured is None and voice:
+            configured = [{"connection": name, "voice_id": voice} for name in sorted(keys)]
+        entries = []
+        for entry in configured if isinstance(configured, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            name, voice_id = entry.get("connection"), entry.get("voice_id")
+            if isinstance(voice_id, str) and voice_id.strip() and name in keys:
+                item = (name, voice_id.strip(), keys[name])
+                if item not in entries:
+                    entries.append(item)
         if not entries:
-            raise ValueError(
-                f"No ElevenLabs voice entries configured for voice={voice!r}. "
-                "Add entries under tts.9router-tts.elevenlabs.voices in config.yaml"
-            )
-
-        db_keys = self._read_db_keys()
-        alias = voice or "default"
-        errors = []
-
-        # Try up to len(entries) attempts
-        for _ in range(len(entries)):
-            entry = self._el_pick_entry(alias, entries)
-            conn_name = entry.get("connection", "")
-            voice_id = entry.get("voice_id", "")
-            api_key = db_keys.get(conn_name)
-
-            if not api_key:
-                logger.warning("No API key found for ElevenLabs connection %r in 9Router DB", conn_name)
-                errors.append(f"{conn_name}: no API key in DB")
-                self._el_advance(alias, entries)
-                continue
-            if not voice_id:
-                errors.append(f"{conn_name}: no voice_id")
-                self._el_advance(alias, entries)
-                continue
-
-            # Determine output format
-            el_format = "mp3_44100_128"
-            if output_path.endswith(".ogg") or fmt == "ogg":
-                el_format = "opus_48000_64"
-            elif output_path.endswith(".wav") or fmt == "wav":
-                el_format = "pcm_44100"
-
-            url = f"{DEFAULT_EL_API}/v1/text-to-speech/{voice_id}"
-            headers = {
-                "xi-api-key": api_key,
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "text": text,
-                "model_id": model_id,
-                "output_format": el_format,
-            }
-
-            try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-                if resp.status_code == 200:
-                    with open(output_path, "wb") as f:
-                        f.write(resp.content)
-                    logger.info("ElevenLabs TTS OK via %s (voice_id=%s)", conn_name, voice_id)
-                    return output_path
-
-                # Parse error
+            raise ValueError("No eligible local ElevenLabs voice mapping and active key")
+        strategy = str(el.get("strategy") or "fill-first").lower()
+        if strategy not in ("fill-first", "round-robin"):
+            raise ValueError("elevenlabs.strategy must be fill-first or round-robin")
+        identity = (_profile(), str(_db_path(settings)), voice, model_id, strategy,
+                    tuple((n, v, hashlib.sha256(k.encode()).digest()) for n, v, k in entries))
+        if fmt == "wav":
+            el_format, actual = "wav_44100", "wav"
+        elif fmt in ("ogg", "opus"):
+            el_format, actual = "opus_48000_64", "ogg"
+        else:
+            el_format, actual = "mp3_44100_128", "mp3"
+        order = self._el_order(identity, entries, strategy)
+        for index in order:
+            _, voice_id, key = entries[index]
+            payload = {"text": text, "model_id": model_id}
+            if speed is not None:
+                payload["voice_settings"] = {"speed": speed}
+            with _session() as session:
                 try:
-                    body = resp.json()
-                except ValueError:
-                    body = {}
+                    response = session.post(
+                        DEFAULT_EL_API + "/v1/text-to-speech/" + quote(voice_id, safe=""),
+                        headers={"xi-api-key": key, "Content-Type": "application/json"},
+                        params={"output_format": el_format}, json=payload,
+                        timeout=_timeout(settings), allow_redirects=False)
+                except Exception:
+                    raise RuntimeError("ElevenLabs request failed; check connectivity and settings") from None
+                try:
+                    if response.status_code == 200:
+                        return _write_audio(output_path, response.content, actual)
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = {}
+                    if not _is_quota_error(response.status_code, body):
+                        raise RuntimeError("ElevenLabs synthesis failed (HTTP %s)" % response.status_code)
+                    self._el_quota(identity, index, len(entries))
+                finally:
+                    response.close()
+        raise RuntimeError("All eligible ElevenLabs connections are quota-limited; retry later")
 
-                if _is_quota_error(resp.status_code, body):
-                    logger.warning("ElevenLabs %s hit quota/rate limit, rotating", conn_name)
-                    errors.append(f"{conn_name}: {resp.status_code} quota/rate")
-                    self._el_advance(alias, entries)
-                    continue
-
-                err_detail = body.get("detail", {})
-                err_msg = err_detail.get("message", "") if isinstance(err_detail, dict) else str(err_detail)
-                errors.append(f"{conn_name}: HTTP {resp.status_code} {err_msg}")
-                self._el_advance(alias, entries)
-                # Non-quota error on specific key: try next
-                continue
-
-            except requests.exceptions.Timeout:
-                errors.append(f"{conn_name}: timeout")
-                self._el_advance(alias, entries)
-                continue
-            except Exception as exc:
-                errors.append(f"{conn_name}: {exc}")
-                self._el_advance(alias, entries)
-                continue
-
-        raise RuntimeError(f"All ElevenLabs keys failed for voice={voice!r}: {'; '.join(errors)}")
-
-    # ── 9Router proxy path ───────────────────────────────────────────────
-
-    def _synthesize_9router(
-        self, text: str, output_path: str, voice: Optional[str],
-        model: Optional[str], fmt: str,
-    ) -> str:
-        import requests
-
-        settings = _load_settings()
-        base = _base_url(settings)
-        timeout = int(settings.get("timeout") or DEFAULT_TIMEOUT)
-        chain = self._model_chain(model)
-
+    def _synthesize_9router(self, text, output_path, voice, model, fmt, settings, speed):
+        base, key = _base_url(settings), _api_key()
+        chain = self._model_chain(model, settings, key)
         if not chain:
-            raise ValueError("No TTS model available on 9Router (catalog empty and no model configured)")
-
-        headers = {"Content-Type": "application/json"}
-        api_key = _api_key()
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        # Build model string: if voice provided and model doesn't already contain it
-        last_error = ""
+            raise ValueError("No TTS model configured or available from 9Router")
+        headers = {"Authorization": "Bearer " + key} if key else {}
         for model_id in chain:
-            # Skip elevenlabs models in 9Router path
-            if _is_elevenlabs_model(model_id):
-                continue
-
-            request_model = model_id
-            if voice and "/" not in model_id:
-                request_model = f"{model_id}/{voice}"
-
-            payload = {"model": request_model, "input": text}
+            payload = {"model": _request_model(model_id, voice), "input": text,
+                       "response_format": fmt if fmt in _FORMATS else "mp3"}
             if voice:
                 payload["voice"] = voice
-            try:
-                resp = requests.post(
-                    f"{base}/v1/audio/speech",
-                    headers=headers, json=payload, timeout=timeout,
-                )
-                if resp.status_code == 200 and resp.content:
-                    with open(output_path, "wb") as f:
-                        f.write(resp.content)
-                    logger.info("9Router TTS OK model=%s", request_model)
-                    return output_path
-
+            if speed is not None:
+                payload["speed"] = speed
+            with _session() as session:
                 try:
-                    body = resp.json()
-                except ValueError:
-                    body = {}
+                    response = session.post(base + "/v1/audio/speech", headers=headers, json=payload,
+                                            timeout=_timeout(settings), allow_redirects=False)
+                except Exception:
+                    raise RuntimeError("9Router TTS request failed; check connectivity and settings") from None
+                try:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = {}
+                    if response.status_code == 200 and not (isinstance(body, dict) and body.get("error")):
+                        audio, actual = _audio_response(response, fmt)
+                        return _write_audio(output_path, audio, actual)
+                    if not _is_quota_error(response.status_code, body):
+                        raise RuntimeError("9Router TTS synthesis failed (HTTP %s)" % response.status_code)
+                finally:
+                    response.close()
+        raise RuntimeError("Configured 9Router TTS models are quota-limited; retry later")
 
-                if _is_quota_error(resp.status_code, body):
-                    logger.warning("9Router model %s hit 429/quota; trying next", model_id)
-                    last_error = f"{model_id}: {resp.status_code}"
-                    continue
+    def synthesize(self, text: str, output_path: str, *, voice: Optional[str] = None,
+                   model: Optional[str] = None, speed: Optional[float] = None,
+                   format: str = "mp3", **extra: Any) -> str:
+        settings = _load_settings()
+        voice = voice or str(settings.get("voice") or settings.get("default_voice") or "").strip() or None
+        if voice and ("/" in voice or any(ord(c) < 32 for c in voice)):
+            raise ValueError("voice must be a single voice ID or alias")
+        model = str(model or settings.get("model") or "").strip()
+        if not model:
+            models = self._fetch_models(settings)
+            model = models[0] if models else ""
+        if not model:
+            raise ValueError("No TTS model configured or available from 9Router")
+        if speed is not None:
+            speed = float(speed)
+            if not math.isfinite(speed) or speed <= 0:
+                raise ValueError("speed must be positive and finite")
+        _timeout(settings)
+        fmt = str(format).strip().lower()
+        if _is_elevenlabs_model(model):
+            return self._synthesize_elevenlabs(text, output_path, voice, model, fmt, settings, speed)
+        return self._synthesize_9router(text, output_path, voice, model, fmt, settings, speed)
 
-                err = body.get("error", {})
-                last_error = str(err.get("message", "")) if isinstance(err, dict) else f"HTTP {resp.status_code}"
-                continue
-
-            except Exception as exc:
-                last_error = f"{model_id}: {exc}"
-                continue
-
-        raise RuntimeError(f"9Router TTS failed: {last_error}")
-
-    # ── Main synthesize ──────────────────────────────────────────────────
-
-    def synthesize(
-        self, text: str, output_path: str, *, voice: Optional[str] = None,
-        model: Optional[str] = None, speed: Optional[float] = None,
-        format: str = "mp3", **extra: Any,
-    ) -> str:
-        # Determine which path based on model string
-        effective_model = model or self.default_model() or ""
-
-        if _is_elevenlabs_model(effective_model):
-            return self._synthesize_elevenlabs(text, output_path, voice, effective_model, format)
-        else:
-            return self._synthesize_9router(text, output_path, voice, model, format)
-
-    def stream(
-        self, text: str, *, voice: Optional[str] = None, model: Optional[str] = None,
-        format: str = "opus", **extra: Any,
-    ) -> Iterator[bytes]:
-        # ponytail: streaming ElevenLabs; add when needed
-        raise NotImplementedError(
-            f"TTS provider {self.name!r} does not implement streaming. "
-            "Use synthesize() instead."
-        )
+    def stream(self, text: str, *, voice: Optional[str] = None, model: Optional[str] = None,
+               format: str = "opus", **extra: Any) -> Iterator[bytes]:
+        raise NotImplementedError("9Router TTS uses whole-file synthesis")
 
 
-def register(ctx) -> None:  # pragma: no cover
+def register(ctx) -> None:
     ctx.register_tts_provider(NineRouterTTSProvider())

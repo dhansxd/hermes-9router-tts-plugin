@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-9router-tts"
-version = "0.1.0"
-description = "Text-to-speech via 9Router gateway with Elevenlabs direct multi-key rotation for Hermes Agent"
+version = "0.1.1"
+description = "Native Hermes TTS via 9Router and optional local ElevenLabs rotation"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = [
-    "requests",
-]
+dependencies = ["requests>=2.31"]
+
+[project.entry-points."hermes_agent.plugins"]
+"9router-tts" = "hermes_9router_tts:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.urls]
 Homepage = "https://github.com/dhansxd/hermes-9router-tts-plugin"
