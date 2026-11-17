@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import wave
 from unittest.mock import patch
 
 import requests
@@ -83,7 +84,7 @@ def main():
             "model": "gemini/fixture-model",
             "voice": "fixture-voice",
             "speed": 1.25,
-            "output_format": "ogg",
+            "output_format": "wav",
             "9router-tts": {
                 "base_url": "http://gateway.invalid",
                 "model": "gemini/scoped-default",
@@ -91,14 +92,13 @@ def main():
             },
         }
         save_config(cfg)
-        fixture = root / "fixture.ogg"
-        # Standard ubuntu-latest provides ffmpeg. Generate a valid tiny silent
-        # Opus container so native Hermes delivery runs without mocked host code.
-        run("ffmpeg", "-v", "error", "-f", "lavfi", "-i",
-            "anullsrc=r=24000:cl=mono", "-t", "0.08", "-c:a", "libopus", fixture)
+        fixture = root / "fixture.wav"
+        with wave.open(str(fixture), "wb") as audio:
+            audio.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+            audio.writeframes(b"\\0\\0" * 1920)
         audio_bytes = fixture.read_bytes()
-        assert audio_bytes.startswith(b"OggS") and b"OpusHead" in audio_bytes
-        output = root / "native.ogg"
+        assert audio_bytes.startswith(b"RIFF")
+        output = root / "native.wav"
         calls = []
 
         def transport(session, method, url, **kwargs):
@@ -111,12 +111,12 @@ def main():
             assert payload["input"] == "Native cloud speech", payload
             assert payload["voice"] == "fixture-voice", payload
             assert payload["speed"] == 1.25, payload
-            assert payload["response_format"] == "ogg", payload
+            assert payload["response_format"] == "wav", payload
             assert "Authorization" not in kwargs.get("headers", {})
             calls.append(url)
             response = requests.Response()
             response.status_code = 200
-            response.headers["Content-Type"] = "audio/ogg"
+            response.headers["Content-Type"] = "audio/wav"
             response._content = audio_bytes
             response._content_consumed = True
             return response
@@ -127,8 +127,13 @@ def main():
             result = json.loads(text_to_speech_tool("Native cloud speech", str(output)))
         assert result["success"] and result["provider"] == "9router-tts", result
         assert result["voice_compatible"] is True, result
-        assert result["file_path"] == str(output), result
-        assert Path(result["file_path"]).read_bytes() == audio_bytes
+        written = Path(result["file_path"])
+        assert written.is_file(), result
+        if written.suffix == ".wav":
+            assert written == output and written.read_bytes() == audio_bytes
+        else:
+            # Hermes may convert voice-compatible output when ffmpeg is present.
+            assert written.suffix == ".ogg" and written.read_bytes().startswith(b"OggS"), result
         assert result["chunk_count"] == 1 and result["delivery_file_count"] == 1, result
         assert len(calls) == 1, calls
 
